@@ -115,7 +115,10 @@ class SettingsDialog(QDialog):
 
     def _on_ok(self):
         if self.ctx.is_project_open():
-            self.ctx.settings_service.set_aseprite_path(self.ase_edit.text().strip())
+            aseprite_path = self.ase_edit.text().strip()
+            self.ctx.settings_service.set_aseprite_path(aseprite_path)
+            if self.ctx.aseprite_service:
+                self.ctx.aseprite_service.set_aseprite_path(aseprite_path)
             self.ctx.settings_service.set_thumbnail_size(self.thumb_combo.currentData())
             # Update thumbnail service
             if self.ctx.thumbnail_service:

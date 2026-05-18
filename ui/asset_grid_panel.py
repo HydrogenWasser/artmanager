@@ -5,21 +5,23 @@ import os
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QGridLayout, QScrollArea, QLabel, QFrame, QMenu, QMessageBox, QFileDialog, QCheckBox
 )
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import Qt, QEvent, Signal
+from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
 
-from core.constants import FILE_TYPE_IMAGE, FILE_TYPE_ASEPRITE, FILE_TYPE_GIF
+from core.constants import FILE_TYPE_FILTER_OPTIONS, FILE_TYPE_IMAGE, FILE_TYPE_ASEPRITE, FILE_TYPE_GIF
 
 
 class AssetCard(QFrame):
     """Card widget for displaying a node or file."""
 
-    def __init__(self, title: str, subtitle: str, card_type: str, item_id: int, parent=None):
+    def __init__(self, title: str, subtitle: str, card_type: str, item_id: int,
+                 card_width: int = 180, card_height: int = 220, thumb_size: int = 160, parent=None):
         super().__init__(parent)
         self.card_type = card_type  # 'node' or 'file'
         self.item_id = item_id
+        self.thumb_size = thumb_size
         self.setObjectName("AssetCard")
-        self.setFixedSize(180, 220)
+        self.setFixedSize(card_width, card_height)
         self.setCursor(Qt.PointingHandCursor)
 
         layout = QVBoxLayout(self)
@@ -29,7 +31,7 @@ class AssetCard(QFrame):
 
         # Thumbnail placeholder
         self.thumb_label = QLabel()
-        self.thumb_label.setFixedSize(160, 160)
+        self.thumb_label.setFixedSize(thumb_size, thumb_size)
         self.thumb_label.setAlignment(Qt.AlignCenter)
         self.thumb_label.setStyleSheet(
             "background-color: #1E1E1E; border-radius: 4px; font-size: 48px; color: #6CA0DC;"
@@ -53,16 +55,61 @@ class AssetCard(QFrame):
 
     def set_thumbnail(self, pixmap: QPixmap):
         if pixmap and not pixmap.isNull():
-            scaled = pixmap.scaled(160, 160, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self.thumb_label.setPixmap(scaled)
+            scaled = pixmap.scaled(self.thumb_size, self.thumb_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            scaled = self._normalize_preview_background(scaled)
+            canvas = QPixmap(self.thumb_size, self.thumb_size)
+            canvas.fill(QColor("#FFFFFF"))
+            painter = QPainter(canvas)
+            x = (canvas.width() - scaled.width()) // 2
+            y = (canvas.height() - scaled.height()) // 2
+            painter.drawPixmap(x, y, scaled)
+            painter.end()
+            self.thumb_label.setPixmap(canvas)
             self.thumb_label.setText("")
-            self.thumb_label.setStyleSheet("background-color: #1E1E1E; border-radius: 4px;")
+            self.thumb_label.setStyleSheet("background-color: #FFFFFF; border-radius: 4px;")
         else:
             icon = "\U0001F4C1" if self.card_type == "node" else "\U0001F4C4"
             self.thumb_label.setText(icon)
             self.thumb_label.setStyleSheet(
                 "background-color: #1E1E1E; border-radius: 4px; font-size: 48px; color: #6CA0DC;"
             )
+
+    def _normalize_preview_background(self, pixmap: QPixmap) -> QPixmap:
+        image = pixmap.toImage().convertToFormat(QImage.Format_ARGB32)
+        width = image.width()
+        height = image.height()
+        if width <= 0 or height <= 0:
+            return pixmap
+
+        def is_empty_background(x: int, y: int) -> bool:
+            color = image.pixelColor(x, y)
+            if color.alpha() < 8:
+                return True
+            return color.red() <= 8 and color.green() <= 8 and color.blue() <= 8
+
+        edge_points = []
+        for x in range(width):
+            edge_points.append((x, 0))
+            edge_points.append((x, height - 1))
+        for y in range(1, height - 1):
+            edge_points.append((0, y))
+            edge_points.append((width - 1, y))
+
+        visited = set()
+        stack = [point for point in edge_points if is_empty_background(*point)]
+        white = QColor("#FFFFFF")
+
+        while stack:
+            x, y = stack.pop()
+            if (x, y) in visited or not (0 <= x < width and 0 <= y < height):
+                continue
+            visited.add((x, y))
+            if not is_empty_background(x, y):
+                continue
+            image.setPixelColor(x, y, white)
+            stack.extend(((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)))
+
+        return QPixmap.fromImage(image)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -94,6 +141,9 @@ class AssetGridPanel(QWidget):
     item_selected = Signal(str, int)  # type, id
     node_double_clicked = Signal(int)
     file_double_clicked = Signal(int)
+    MIN_THUMB_SIZE = 96
+    MAX_THUMB_SIZE = 320
+    THUMB_ZOOM_STEP = 16
 
     def __init__(self, app_context):
         super().__init__()
@@ -102,6 +152,8 @@ class AssetGridPanel(QWidget):
         self._cards: list[AssetCard] = []
         self._thumbnail_cards: dict[str, list[AssetCard]] = {}
         self._thumbnail_signal_source = None
+        self._thumb_size = 160
+        self._file_type_filter: set[str] = {file_type for file_type, _ in FILE_TYPE_FILTER_OPTIONS}
         self._setup_ui()
 
     def _setup_ui(self):
@@ -112,6 +164,7 @@ class AssetGridPanel(QWidget):
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll_area.viewport().installEventFilter(self)
 
         self.container = QWidget()
         self.grid = QGridLayout(self.container)
@@ -133,6 +186,16 @@ class AssetGridPanel(QWidget):
         self._current_node_id = None
         self.empty_label.setVisible(False)
 
+    def set_file_type_filter(self, selected_file_types: set[str]):
+        self._file_type_filter = set(selected_file_types)
+        self.refresh()
+
+    def get_file_type_filter(self) -> set[str]:
+        return set(self._file_type_filter)
+
+    def accepts_file_type(self, file_type: str) -> bool:
+        return file_type in self._file_type_filter
+
     def _clear_grid(self):
         while self.grid.count():
             child = self.grid.takeAt(0)
@@ -149,9 +212,17 @@ class AssetGridPanel(QWidget):
         self._ensure_thumbnail_signal()
 
         children = self.ctx.database_service.get_children(node_id)
-        files = self.ctx.database_service.get_files_by_node(node_id)
+        all_files = self.ctx.database_service.get_files_by_node(node_id)
+        files = [
+            file for file in all_files
+            if self.accepts_file_type(file.file_type)
+        ]
 
         if not children and not files:
+            if all_files:
+                self.empty_label.setText("没有符合类型筛选的文件")
+            else:
+                self.empty_label.setText("该节点没有子节点或文件")
             self.empty_label.setVisible(True)
             self.scroll_area.setVisible(False)
             return
@@ -163,7 +234,7 @@ class AssetGridPanel(QWidget):
         max_cols = self._calculate_columns()
 
         for child in children:
-            card = AssetCard(child.name, "", "node", child.id)
+            card = self._create_asset_card(child.name, "", "node", child.id)
             self.grid.addWidget(card, row, col)
             self._cards.append(card)
             col += 1
@@ -174,7 +245,7 @@ class AssetGridPanel(QWidget):
         for file in files:
             import os
             filename = os.path.basename(file.file_path)
-            card = AssetCard(filename, file.file_type, "file", file.id)
+            card = self._create_asset_card(filename, file.file_type, "file", file.id)
             self.grid.addWidget(card, row, col)
             self._cards.append(card)
 
@@ -218,9 +289,45 @@ class AssetGridPanel(QWidget):
 
     def _calculate_columns(self) -> int:
         width = self.scroll_area.viewport().width() - 20
-        card_width = 180 + 12
+        card_width = self._card_width() + 12
         cols = max(1, width // card_width)
         return cols
+
+    def _card_width(self) -> int:
+        return self._thumb_size + 20
+
+    def _card_height(self) -> int:
+        return self._thumb_size + 60
+
+    def _create_asset_card(self, title: str, subtitle: str, card_type: str, item_id: int) -> AssetCard:
+        return AssetCard(
+            title,
+            subtitle,
+            card_type,
+            item_id,
+            card_width=self._card_width(),
+            card_height=self._card_height(),
+            thumb_size=self._thumb_size,
+        )
+
+    def eventFilter(self, watched, event):
+        if watched is self.scroll_area.viewport() and event.type() == QEvent.Type.Wheel:
+            if event.modifiers() & Qt.ControlModifier:
+                self._zoom_thumbnails(event.angleDelta().y())
+                event.accept()
+                return True
+        return super().eventFilter(watched, event)
+
+    def _zoom_thumbnails(self, delta: int):
+        if delta == 0:
+            return
+        direction = 1 if delta > 0 else -1
+        new_size = self._thumb_size + direction * self.THUMB_ZOOM_STEP
+        new_size = max(self.MIN_THUMB_SIZE, min(self.MAX_THUMB_SIZE, new_size))
+        if new_size == self._thumb_size:
+            return
+        self._thumb_size = new_size
+        self.refresh()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -390,7 +497,7 @@ class AssetGridPanel(QWidget):
 
     def _create_search_card(self, title: str, subtitle: str, card_type: str, item_id: int):
         """Create a card for search results."""
-        return AssetCard(title, subtitle, card_type, item_id)
+        return self._create_asset_card(title, subtitle, card_type, item_id)
 
     def _delete_file(self, file_id: int):
         file = self.ctx.database_service.get_file(file_id)

@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QTimer, QSettings
 
+from core.constants import FILE_TYPE_FILTER_OPTIONS
 from ui.asset_tree_panel import AssetTreePanel
 from ui.asset_grid_panel import AssetGridPanel
 from ui.inspector_panel import InspectorPanel
@@ -18,6 +19,7 @@ from ui.dialogs import NewNodeDialog, SettingsDialog
 
 class MainWindow(QMainWindow):
     MAX_RECENT_PROJECTS = 5
+    FILE_TYPE_FILTER_SETTING = "file_type_filter"
 
     def __init__(self, app_context):
         super().__init__()
@@ -29,9 +31,12 @@ class MainWindow(QMainWindow):
 
         self._settings = QSettings("PixelAssetManager", "App")
         self._recent_menu = None
+        self._file_type_actions = {}
+        self._file_type_all_action = None
 
         self._setup_ui()
         self._connect_signals()
+        self._apply_saved_file_type_filter()
 
         # Prompt to open project on startup (delayed so window shows first)
         QTimer.singleShot(100, self._prompt_open_project)
@@ -63,6 +68,27 @@ class MainWindow(QMainWindow):
 
     def _set_last_project(self, path: str) -> None:
         self._settings.setValue("last_project", path)
+
+    def _get_all_file_types(self) -> set[str]:
+        return {file_type for file_type, _ in FILE_TYPE_FILTER_OPTIONS}
+
+    def _get_saved_file_type_filter(self) -> set[str]:
+        raw = self._settings.value(self.FILE_TYPE_FILTER_SETTING, "")
+        if not raw:
+            return self._get_all_file_types()
+        try:
+            saved = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return self._get_all_file_types()
+        valid_types = self._get_all_file_types()
+        return {file_type for file_type in saved if file_type in valid_types}
+
+    def _save_file_type_filter(self, selected_file_types: set[str]) -> None:
+        ordered = [
+            file_type for file_type, _ in FILE_TYPE_FILTER_OPTIONS
+            if file_type in selected_file_types
+        ]
+        self._settings.setValue(self.FILE_TYPE_FILTER_SETTING, json.dumps(ordered))
 
     # --- UI ---
 
@@ -118,6 +144,24 @@ class MainWindow(QMainWindow):
         self.search_edit.setClearButtonEnabled(True)
         self.toolbar.addWidget(self.search_edit)
 
+        self.file_type_button = QToolButton()
+        self.file_type_button.setPopupMode(QToolButton.InstantPopup)
+        file_type_menu = QMenu(self.file_type_button)
+
+        self._file_type_all_action = file_type_menu.addAction("全部类型")
+        self._file_type_all_action.setCheckable(True)
+        self._file_type_all_action.triggered.connect(self._on_all_file_types_toggled)
+        file_type_menu.addSeparator()
+
+        for file_type, label in FILE_TYPE_FILTER_OPTIONS:
+            action = file_type_menu.addAction(label)
+            action.setCheckable(True)
+            action.triggered.connect(self._on_file_type_filter_changed)
+            self._file_type_actions[file_type] = action
+
+        self.file_type_button.setMenu(file_type_menu)
+        self.toolbar.addWidget(self.file_type_button)
+
         self.toolbar.addSeparator()
 
         btn_settings = QPushButton("设置")
@@ -150,6 +194,56 @@ class MainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("就绪")
+
+    def _apply_saved_file_type_filter(self):
+        selected = self._get_saved_file_type_filter()
+        self._set_file_type_actions(selected)
+        self.grid_panel.set_file_type_filter(selected)
+
+    def _set_file_type_actions(self, selected_file_types: set[str]):
+        all_types = self._get_all_file_types()
+        for file_type, action in self._file_type_actions.items():
+            action.blockSignals(True)
+            action.setChecked(file_type in selected_file_types)
+            action.blockSignals(False)
+        if self._file_type_all_action is not None:
+            self._file_type_all_action.blockSignals(True)
+            self._file_type_all_action.setChecked(selected_file_types == all_types)
+            self._file_type_all_action.blockSignals(False)
+        self._update_file_type_button_text(selected_file_types)
+
+    def _update_file_type_button_text(self, selected_file_types: set[str]):
+        all_types = self._get_all_file_types()
+        if selected_file_types == all_types:
+            text = "类型: 全部"
+        elif not selected_file_types:
+            text = "类型: 无"
+        elif len(selected_file_types) == 1:
+            labels = dict(FILE_TYPE_FILTER_OPTIONS)
+            text = f"类型: {labels[next(iter(selected_file_types))]}"
+        else:
+            text = f"类型: {len(selected_file_types)} 项"
+        self.file_type_button.setText(text)
+
+    def _on_all_file_types_toggled(self):
+        self._apply_file_type_filter(self._get_all_file_types())
+
+    def _on_file_type_filter_changed(self):
+        selected = {
+            file_type for file_type, action in self._file_type_actions.items()
+            if action.isChecked()
+        }
+        self._apply_file_type_filter(selected)
+
+    def _apply_file_type_filter(self, selected_file_types: set[str]):
+        self._set_file_type_actions(selected_file_types)
+        self._save_file_type_filter(selected_file_types)
+        self.grid_panel.set_file_type_filter(selected_file_types)
+        if self.search_edit.text().strip():
+            self._on_search_changed(self.search_edit.text())
+        node_id = self.tree_panel.get_current_node_id()
+        if node_id is not None:
+            self._update_status_bar(node_id)
 
     def _update_recent_menu(self):
         if self._recent_menu is None:
@@ -321,23 +415,40 @@ class MainWindow(QMainWindow):
 
         row, col = 0, 0
         max_cols = self.grid_panel._calculate_columns()
+        visible_count = 0
 
         for result in results:
             if result.result_type == "node":
                 card = self.grid_panel._create_search_card(result.name, "", "node", result.id)
             else:
+                file = self.ctx.database_service.get_file(result.id)
+                if not file or not self.grid_panel.accepts_file_type(file.file_type):
+                    continue
                 card = self.grid_panel._create_search_card(result.name, result.path, "file", result.id)
 
             self.grid_panel.grid.addWidget(card, row, col)
             self.grid_panel._cards.append(card)
+            visible_count += 1
             col += 1
             if col >= max_cols:
                 col = 0
                 row += 1
+
+        if visible_count == 0:
+            self.grid_panel.empty_label.setText("未找到匹配结果")
+            self.grid_panel.empty_label.setVisible(True)
+            self.grid_panel.scroll_area.setVisible(False)
 
     def _update_status_bar(self, node_id: int):
         if not self.ctx.is_project_open():
             return
         children = self.ctx.database_service.get_children(node_id)
         files = self.ctx.database_service.get_files_by_node(node_id)
-        self.status_bar.showMessage(f"子节点: {len(children)} | 文件: {len(files)}")
+        visible_files = [
+            file for file in files
+            if self.grid_panel.accepts_file_type(file.file_type)
+        ]
+        if len(visible_files) == len(files):
+            self.status_bar.showMessage(f"子节点: {len(children)} | 文件: {len(files)}")
+        else:
+            self.status_bar.showMessage(f"子节点: {len(children)} | 文件: {len(visible_files)}/{len(files)}")

@@ -15,6 +15,15 @@ FILE_TYPE_GIF = "gif"
 FILE_TYPE_FOLDER = "folder"
 FILE_TYPE_OTHER = "other"
 
+FILE_TYPE_FILTER_OPTIONS = [
+    (FILE_TYPE_IMAGE, "图片"),
+    (FILE_TYPE_GIF, "GIF"),
+    (FILE_TYPE_ASEPRITE, "Aseprite"),
+    (FILE_TYPE_SPRITESHEET, "Spritesheet"),
+    (FILE_TYPE_JSON, "JSON"),
+    (FILE_TYPE_OTHER, "其他"),
+]
+
 # File roles
 ROLE_AI_SOURCE = "ai_source"
 ROLE_ASEPRITE_SOURCE = "aseprite_source"
